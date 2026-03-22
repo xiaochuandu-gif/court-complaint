@@ -1317,8 +1317,30 @@ class ComplaintApp:
                     email=defaults.get("email", ""),
                 )
 
+    def _account_save_callback(self, platform_name: str, username: str, password: str):
+        """适配器注册成功后的账号保存回调"""
+        if self.account_manager:
+            defaults = self.account_manager.get_default_credentials() or {}
+            self.account_manager.save_account(
+                platform_name, username, password,
+                phone=defaults.get("phone", ""),
+                email=defaults.get("email", ""),
+            )
+            self._log(f"  💾 已保存账号: {username}", "success")
+            # 同步更新 GUI 中的账号输入框
+            self.root.after(0, lambda p=platform_name, u=username, pw=password: self._update_account_entry(p, u, pw))
+
+    def _update_account_entry(self, platform: str, username: str, password: str):
+        """更新 GUI 中某个平台的账号输入框"""
+        if platform in self.platform_account_entries:
+            entries = self.platform_account_entries[platform]
+            entries["username"].delete(0, tk.END)
+            entries["username"].insert(0, username)
+            entries["password"].delete(0, tk.END)
+            entries["password"].insert(0, password)
+
     def _auto_login_worker(self, selected_channels, content):
-        """自动登录工作线程"""
+        """自动登录工作线程 - 完整的注册->保存->登录->确认闭环"""
         try:
             # 启动浏览器
             self._update_ui_status("正在启动浏览器...")
@@ -1335,6 +1357,12 @@ class ComplaintApp:
 
             self.browser_engine = engine
             self._log("浏览器启动成功", "success")
+
+            # 获取默认注册信息
+            defaults = self.account_manager.get_default_credentials() if self.account_manager else None
+            default_phone = defaults.get("phone", "") if defaults else ""
+            default_email = defaults.get("email", "") if defaults else ""
+            default_password = defaults.get("default_password", "") if defaults else ""
 
             # 逐个处理选中的平台
             success_count = 0
@@ -1357,92 +1385,110 @@ class ComplaintApp:
                 # 纯电话渠道
                 if ch_data.get("phone") and not url:
                     phone_channels.append({"name": name, "phone": ch_data["phone"]})
-                    self._log(f"  电话渠道: {ch_data['phone']}，跳过自动登录", "info")
+                    self._log(f"  电话渠道: {ch_data['phone']}，跳过", "info")
                     continue
 
                 # 获取适配器
                 adapter = get_adapter(name, engine)
+                # 设置账号保存回调
+                adapter.set_account_save_callback(self._account_save_callback)
 
-                # 检查是否有保存的账号
-                account = None
-                if self.account_manager:
-                    account = self.account_manager.get_account(name)
-
-                if adapter.NEEDS_LOGIN:
-                    if account:
-                        # 尝试自动登录
-                        self._log(f"  使用保存的账号尝试登录...", "info")
-                        result = adapter.auto_login(account["username"], account["password"])
-
-                        if result.is_success():
-                            self._log(f"  ✅ {result.message}", "success")
-                            self._update_platform_status(name, "已登录", "#059669")
-                            success_count += 1
-                        elif result.need_takeover:
-                            # 需要手动接管
-                            self._log(f"  ⚠ {result.message}", "takeover")
-                            self._update_platform_status(name, "需手动操作", "#d97706")
-                            engine.enter_takeover_mode(result.message)
-
-                            # 在主线程弹出提示
-                            self.root.after(0, lambda n=name, m=result.message: self._show_takeover_dialog(n, m))
-
-                            # 等待用户完成手动操作
-                            completed = engine.wait_for_takeover_complete(timeout=300)
-                            if completed:
-                                self._log(f"  ✅ 用户已完成手动操作", "success")
-                                self._update_platform_status(name, "已登录", "#059669")
-                                success_count += 1
-                            else:
-                                self._log(f"  ⚠ 手动操作超时", "warning")
-                                manual_count += 1
-                        else:
-                            self._log(f"  ❌ {result.message}", "error")
-                            self._update_platform_status(name, "登录失败", "#dc2626")
-                            fail_count += 1
-                    else:
-                        # 没有保存的账号，尝试注册或提示手动登录
-                        defaults = self.account_manager.get_default_credentials() if self.account_manager else None
-                        if defaults and defaults.get("phone"):
-                            self._log(f"  未保存账号，尝试自动注册...", "info")
-                            result = adapter.auto_register(
-                                defaults["phone"],
-                                defaults.get("email", ""),
-                                defaults.get("default_password", ""),
-                            )
-                            if result.need_takeover:
-                                self._log(f"  ⚠ {result.message}", "takeover")
-                                engine.enter_takeover_mode(result.message)
-                                self.root.after(0, lambda n=name, m=result.message: self._show_takeover_dialog(n, m))
-                                completed = engine.wait_for_takeover_complete(timeout=300)
-                                if completed:
-                                    self._log(f"  ✅ 用户已完成手动操作", "success")
-                                    success_count += 1
-                                else:
-                                    manual_count += 1
-                            elif result.is_success():
-                                success_count += 1
-                            else:
-                                fail_count += 1
-                        else:
-                            # 直接打开页面，提示手动登录
-                            self._log(f"  未保存账号，打开页面供手动登录...", "warning")
-                            if url:
-                                engine.navigate(url, wait_seconds=2)
-                                engine.enter_takeover_mode(f"请在浏览器中手动登录 {name}")
-                                self.root.after(0, lambda n=name: self._show_takeover_dialog(
-                                    n, f"请在浏览器中手动登录 {n}，完成后点击【继续】"))
-                                completed = engine.wait_for_takeover_complete(timeout=300)
-                                if completed:
-                                    success_count += 1
-                                else:
-                                    manual_count += 1
-                else:
-                    # 不需要登录的平台，直接打开
+                # 不需要登录的平台
+                if not adapter.NEEDS_LOGIN:
                     self._log(f"  该平台无需登录", "info")
+                    self._update_platform_status(name, "无需登录", "#059669")
                     if url:
                         engine.navigate(url, wait_seconds=2)
                     success_count += 1
+                    # 打开投诉页面
+                    if url:
+                        try:
+                            engine.switch_to_new_tab(url)
+                            self._log(f"  已打开投诉页面", "info")
+                        except Exception:
+                            pass
+                    continue
+
+                # ============================================
+                # 需要登录的平台：完整闭环流程
+                # ============================================
+
+                # 获取已保存的账号
+                account = self.account_manager.get_account(name) if self.account_manager else None
+                username = account["username"] if account else ""
+                password = account["password"] if account else ""
+
+                # 调用适配器的完整登录/注册闭环
+                result = adapter.login_or_register(
+                    username=username,
+                    password=password,
+                    phone=default_phone,
+                    email=default_email,
+                    default_password=default_password,
+                )
+
+                if result.is_success():
+                    # 直接登录成功
+                    self._log(f"  ✅ {result.message}", "success")
+                    self._update_platform_status(name, "已登录", "#059669")
+                    success_count += 1
+
+                elif result.need_takeover:
+                    # 需要手动接管（验证码、短信验证码等）
+                    self._log(f"  ⚠ 需要手动操作: {result.message}", "takeover")
+                    self._update_platform_status(name, "需手动操作", "#d97706")
+
+                    # 记录可能的注册信息（用于接管后保存）
+                    pending_username = result.registered_username or username
+                    pending_password = result.registered_password or password
+
+                    engine.enter_takeover_mode(result.message)
+
+                    # 在主线程弹出提示
+                    self.root.after(0, lambda n=name, m=result.message: self._show_takeover_dialog(n, m))
+
+                    # 等待用户完成手动操作（最多5分钟）
+                    completed = engine.wait_for_takeover_complete(timeout=300)
+
+                    if completed:
+                        # 用户完成了手动操作，验证登录状态
+                        self._log(f"  用户已完成手动操作，正在验证登录状态...", "info")
+
+                        verify_result = adapter.post_takeover_verify(
+                            username=pending_username,
+                            password=pending_password,
+                        )
+
+                        if verify_result.is_success():
+                            self._log(f"  ✅ 验证通过：登录成功！", "success")
+                            self._update_platform_status(name, "已登录", "#059669")
+                            success_count += 1
+                        else:
+                            # 验证失败，但用户说完成了，给一次重试机会
+                            self._log(f"  ⚠ 首次验证未通过，等待页面加载后重试...", "warning")
+                            import time as _time
+                            _time.sleep(5)
+
+                            if adapter._verify_login_success():
+                                self._log(f"  ✅ 重试验证通过：登录成功！", "success")
+                                self._update_platform_status(name, "已登录", "#059669")
+                                if pending_username and pending_password:
+                                    self._account_save_callback(name, pending_username, pending_password)
+                                success_count += 1
+                            else:
+                                self._log(f"  ⚠ 验证未通过，但已完成手动操作", "warning")
+                                self._update_platform_status(name, "状态待确认", "#d97706")
+                                manual_count += 1
+                    else:
+                        self._log(f"  ⚠ 手动操作超时", "warning")
+                        self._update_platform_status(name, "超时", "#d97706")
+                        manual_count += 1
+
+                else:
+                    # 登录/注册失败
+                    self._log(f"  ❌ {result.message}", "error")
+                    self._update_platform_status(name, "失败", "#dc2626")
+                    fail_count += 1
 
                 # 打开投诉页面（在新标签页中）
                 if url and not ch_data.get("phone"):
@@ -1452,10 +1498,14 @@ class ComplaintApp:
                     except Exception:
                         self._log(f"  打开投诉页面失败", "warning")
 
-            # 完成
+            # ============================================
+            # 完成汇总
+            # ============================================
             self._log(f"\n{'=' * 50}", "info")
-            self._log(f"自动登录流程完成", "info")
-            self._log(f"  成功: {success_count}  手动: {manual_count}  失败: {fail_count}", "info")
+            self._log(f"自动登录/注册流程完成", "info")
+            self._log(f"  ✅ 成功: {success_count}", "success")
+            self._log(f"  ⚠ 手动/待确认: {manual_count}", "warning")
+            self._log(f"  ❌ 失败: {fail_count}", "error")
 
             if phone_channels:
                 self._log(f"\n📞 以下渠道需要电话投诉:", "warning")
@@ -1470,11 +1520,11 @@ class ComplaintApp:
 
             # 结果提示
             self.root.after(0, lambda: messagebox.showinfo(
-                "自动登录完成",
-                f"自动登录流程已完成！\n\n"
+                "自动登录/注册完成",
+                f"自动登录/注册流程已完成！\n\n"
                 f"✅ 成功登录: {success_count} 个平台\n"
-                f"⚠ 手动操作: {manual_count} 个平台\n"
-                f"❌ 登录失败: {fail_count} 个平台\n\n"
+                f"⚠ 手动/待确认: {manual_count} 个平台\n"
+                f"❌ 失败: {fail_count} 个平台\n\n"
                 f"📋 投诉内容已在剪贴板中\n"
                 f"请在各投诉页面中粘贴（Ctrl+V）内容并提交。\n\n"
                 f"浏览器窗口保持打开，您可以继续操作。"
